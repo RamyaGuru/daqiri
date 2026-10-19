@@ -1,7 +1,8 @@
 # DGX Spark ibverbs CI smoke tests
 
-**By default, each test runs for 30 seconds, paced at 10 Gb/s aggregate payload
-rate.** Set `target_gbps: 0` in a profile or pass `--target-gbps 0` for unpaced TX.
+**By default, each test runs unpaced for 30 seconds (`target_gbps: 0`).** To limit
+the aggregate TX payload rate, set a positive `target_gbps` in a profile or pass
+`--target-gbps 10` for a paced 10 Gb/s run.
 These tests check raw Ethernet TX/RX and flow steering with the ibverbs engine;
 they do not impose a throughput threshold or validate payload contents.
 
@@ -92,7 +93,7 @@ CLI settings override the checked-in profile:
 | `--output DIR` | Required new artifact directory. |
 | `--mode hardware\|cabled` | Override profile topology. |
 | `--seconds N` | Override duration; default 30. |
-| `--target-gbps G` | Aggregate TX payload rate; default 10, **0 disables pacing**. |
+| `--target-gbps G` | Aggregate TX payload rate in Gb/s; **default 0 is unpaced**. Positive values enable pacing. |
 | `--tx NETDEV_OR_BDF`, `--rx NETDEV_OR_BDF` | Override automatic port selection. Hardware mode requires the same port. |
 | `--cores A,B,C,D,E` | Allowed CPU IDs for master, TX queue, RX queue, TX application, RX application; otherwise discovered. |
 | `--[no-]strict-physical-counters` | Hardware mode: require exactly flat PHY counters; default off to allow background traffic. |
@@ -127,7 +128,7 @@ against other users too.
 
 ## Optional host tuning for higher performance
 
-Explore in priority order with the lab owner using higher-rate or unpaced tests.
+Explore in priority order with the lab owner using the default unpaced tests.
 These changes are not automated; coordinate shared-host impact and restoration.
 Procedures are in the
 [Spark configuration guide](../../docs/tutorials/system_configuration.md#dgx-spark-profile).

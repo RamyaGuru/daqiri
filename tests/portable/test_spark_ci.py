@@ -92,7 +92,7 @@ def test_checked_in_profiles_and_cli_precedence(mode, tmp_path):
         "--profile", str(root / f"ci/spark/profiles/{mode}.yaml"),
         "--output", str(tmp_path / "result"),
     ])
-    assert (args.mode, args.seconds, args.target_gbps) == (mode, 30, 10)
+    assert (args.mode, args.seconds, args.target_gbps) == (mode, 30, 0)
     args = runner.parse_args([
         "--profile", str(root / f"ci/spark/profiles/{mode}.yaml"),
         "--output", str(tmp_path / "result"), "--seconds", "2",

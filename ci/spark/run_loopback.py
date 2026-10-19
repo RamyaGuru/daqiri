@@ -332,14 +332,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rx", help="RX netdev or PCI BDF; otherwise discovered")
     parser.add_argument("--cores", type=lambda s: [int(c) for c in s.split(",")])
     parser.add_argument("--target-gbps", type=float,
-                        help="aggregate payload rate; default 10 for smoke testing; 0 is unpaced")
+                        help="aggregate payload rate in Gb/s; default 0 is unpaced")
     parser.add_argument("--output", type=Path, required=True, help="new artifact directory")
     parser.add_argument("--prepare-only", action="store_true", help="discover and render without running hardware")
     parser.add_argument("--strict-physical-counters", action=argparse.BooleanOptionalAction,
                         default=None,
                         help="hardware mode: require exactly flat PHY counters on a quiet port")
     args = parser.parse_args(argv)
-    defaults = dict(mode="hardware", seconds=30, target_gbps=10,
+    defaults = dict(mode="hardware", seconds=30, target_gbps=0,
                     strict_physical_counters=False)
     try:
         profile = yaml.safe_load(args.profile.read_text())
