@@ -1,26 +1,21 @@
 # DGX Spark ibverbs CI smoke tests
 
-Run these commands on the Spark **host, from the DAQIRI checkout root**. Blossom
-owns checkout, image preparation, exclusive Spark allocation, outer timeout, and
-artifact archiving. The runner owns discovery, YAML generation, the timed test,
-counter checks, and cleanup. Both profiles run for 30 seconds at a paced 10 Gb/s;
-they are functional smoke tests without a performance threshold.
+**By default, each test runs for 30 seconds, paced at 10 Gb/s aggregate payload
+rate.** Set `target_gbps: 0` in a profile or pass `--target-gbps 0` for unpaced TX.
+These tests check raw Ethernet TX/RX and flow steering with the ibverbs engine;
+they do not impose a throughput threshold or validate payload contents.
 
-## Provision once, outside Blossom jobs
+Run all commands on the Spark **host, from the DAQIRI checkout root**. Blossom
+provides checkout, image preparation, exclusive hardware allocation, timeout,
+and artifact archiving; the runner handles discovery, execution, and cleanup.
 
-A lab administrator completes this section when preparing or repairing the host.
-These package installs, driver/module setup, firmware changes, and reboots are
-**not steps in the Blossom build or benchmark jobs**. CI assumes a provisioned
-Spark and only checks/accesses its hardware.
+## Initial provisioning (outside of Blossom jobs)
 
-Use the supported Spark DGX OS/NVIDIA driver stack with Docker and NVIDIA
-Container Toolkit. The job account needs Docker access; it runs privileged,
-host-networked GPU containers. Host Python 3.10+ and `python3-venv` are required.
-Keep Spark's matching mlx5 drivers and NVIDIA package repositories. See the
-[Spark system configuration](../../docs/tutorials/system_configuration.md#dgx-spark-profile)
-and [NVIDIA container runtime guide](https://docs.nvidia.com/dgx/dgx-spark/nvidia-container-runtime-for-docker.html).
+A lab administrator prepares the host once. Use the supported Spark DGX OS and
+NVIDIA drivers, Docker with NVIDIA Container Toolkit, and Python 3.10+. The job
+account needs Docker access for privileged, host-networked GPU containers.
 
-If host utilities/modules are missing, a provisioning administrator can run:
+If these host utilities or modules are missing:
 
 ```bash
 sudo apt-get update
@@ -31,101 +26,46 @@ nvidia-smi
 ibv_devinfo
 ```
 
-Verify Ethernet link layer in `ibv_devinfo` or
-`/sys/class/infiniband/<device>/ports/*/link_layer`. If a VPI adapter needs a
-change, query its discovered BDF with NVIDIA MFT's `mlxconfig`, set
-`LINK_TYPE_P1=ETH LINK_TYPE_P2=ETH`, and reboot before CI. Ethernet-only firmware
-may omit those options. Standard UDP steering needs no flex-parser settings.
+Verify Ethernet link layer in `ibv_devinfo`. If a VPI adapter needs Ethernet
+configuration, use NVIDIA MFT's `mlxconfig` on the discovered BDF and reboot
+before CI. These profiles use `host_pinned` memory and need no hugepage
+reservation. Leave existing reservations unchanged.
 
-- **Hardware profile:** TX/RX use one enumerated port. Keep the existing cable
-  connected: Spark can remove its CX-7 PCI devices when no cable is detected.
-  Test traffic returns internally; this job does not override hotplug policy.
-- **Cabled profile:** use two distinct physical ports (`p0`, `p1`), connected
-  directly or through the same untagged/access switch VLAN. Both links must have
-  carrier. The switch must permit MAC learning/unicast forwarding and jumbo
-  frames (configure MTU 9000 end to end). Set explicit port overrides for the
-  lab's allocated switch path; carrier alone does not prove VLAN connectivity.
+- **Hardware loopback:** one NIC port transmits and receives internally. Keep
+  Spark's existing cable connected so its hotplug policy leaves the NIC available.
+- **Cabled loopback:** two distinct physical ports (`p0`, `p1`) must have carrier,
+  connected directly or through the same untagged/access switch VLAN. The switch
+  must permit unicast forwarding and jumbo frames (MTU 9000 end to end). Select
+  the allocated ports explicitly if automatic discovery picks another pair.
 
-These profiles use the ibverbs engine and `host_pinned` buffers, allocated with
-`cudaHostAlloc`. Pinned memory does not require a reserved hugetlb pool. The
-ibverbs metadata pools/rings also use ordinary aligned allocations. Therefore
-these profiles do not request hugetlb allocations and are expected to run without
-a hugepage reservation or `/dev/hugepages` mount under default provider settings,
-even though the image also contains the DPDK engine. The mlx5 provider can also
-use hugepages for internal buffers; provider overrides that force hugepage
-allocation have different requirements. A DPDK run or a config using `kind: huge`
-also has different requirements. A 10-second hardware-loopback test passed with
-all HugeTLB usage and reservation limits set to zero in a private child cgroup
-inside the benchmark container. An explicit 1 GiB hugepage allocation failed
-with `ENOMEM`, while the benchmark sent/received 1,551,104 packets and HugeTLB
-usage stayed zero. The host's four reserved 1 GiB pages remained free and unchanged.
-This verifies operation without access to reserved hugetlb pages for that run;
-it does not disable transparent hugepages. Evidence and the test wrapper are in
-ignored `ci-results/no-hugepages-validation/`. Leave existing host reservations alone.
-Hugepage reservation is **not a prerequisite for these CI profiles** and the job
-does not create, resize, or remove the host's pool.
-Wendell reports that the lab Spark already has hugepages enabled; leave that
-provisioned pool available for normal CI runs. Its size/count need not match the
-local test host for these `host_pinned` profiles.
-No peermem, VFIO binding, host IP/routing changes, or namespaces are needed.
-CPU/governor/pause tuning is optional at this smoke-test rate. The engine may
-raise host MTUs; cleanup restores them.
+See [Spark system configuration](../../docs/tutorials/system_configuration.md#dgx-spark-profile)
+and [NVIDIA container setup](https://docs.nvidia.com/dgx/dgx-spark/nvidia-container-runtime-for-docker.html)
+for provisioning details.
 
-## Checkout, dependencies, and image
+## Prepare the checkout and image
 
-Use the exact tested revision and its submodules. The **whole checkout** is the
-deployment unit: the runner imports `scripts/daqiri_config/` from that revision.
-Do not copy the runner alone into the Blossom repository. No DAQIRI Python
-bindings or Jupyter packages are required.
-
-`git submodule update --init --recursive` fetches the `yaml-cpp` and `spdlog`
-versions pinned by the checked-out DAQIRI revision for the container build.
-Blossom can omit this command if its checkout step already initializes submodules
-at those revisions; it is not needed again in each benchmark stage.
+Use the exact tested revision. The runner imports `scripts/daqiri_config/`, so
+run it from the whole checkout. Initialize `yaml-cpp` and `spdlog` submodules
+unless Blossom's checkout already does so. No DAQIRI Python bindings are needed.
 
 ```bash
 git submodule update --init --recursive
 python3 -m venv ci-results/venv
 ci-results/venv/bin/python -m pip install -r ci/spark/requirements.txt
-
 IMAGE_TAG=daqiri:local BASE_TARGET=dpdk DAQIRI_ENGINE="dpdk ibverbs" \
   scripts/build-container.sh
 docker build --build-arg DAQIRI_CI_BASE_IMAGE=daqiri:local \
   -t daqiri:spark-ci -f ci/spark/Dockerfile .
 ```
 
-The tools layer supplies `ethtool`, `ip`, and `mlnx_perf`. Use a host driver
-compatible with the build's CUDA version (currently 13.1 by default); set
-`CUDA_VERSION` for the base build if needed. Blossom can build once and pass the
-resulting image tag to each test stage.
+The tools image adds `ethtool`, `ip`, and `mlnx_perf`. Use a host driver compatible
+with the base image's CUDA version (default 13.1); set `CUDA_VERSION` for the base
+build if needed. Reuse the resulting image across test stages.
 
-## Host tuning to discuss with Wendell (optional, in priority order)
+## Run the tests
 
-This is an investigation list, not additional provisioning requirements or
-changes performed by the runner. Agree on device/core allocation and rollback
-with the lab owner before trials. The current 10 Gb/s paced smoke test is not a
-maximum-throughput benchmark: compare baseline and one change at a time in an
-agreed performance window at a higher target rate (or unpaced), retaining the
-same packet/configuration settings and stable NIC-counter samples.
-
-| Priority | Explore | Scope and impact on other jobs |
-|---|---|---|
-| 1 | **CPU placement and scheduling:** allocate four high-frequency cores for queue/application workers plus an allowed master core; use `--cores` within Blossom's CPU allocation. | Affinity is job-scoped and already supported. Reserve the allocated cores against competing jobs; pinning alone does not isolate them. No reboot or boot-parameter change needed. |
-| 2 | **CPU governor:** first verify `performance`, the documented Spark default; compare only if the lab uses another policy. | Reading is harmless. Changing it can affect other jobs sharing a CPU frequency policy, power, and thermals; save/restore the prior governor or make it an agreed host baseline. |
-| 3 | **Ethernet pause:** inspect saved pause state/counters, then consider disabling link-level pause on dedicated test ports and their switch peers if it is throttling traffic. | Port/switch-wide, not container-scoped. Other raw/RDMA traffic can depend on flow control. Coordinate with the network owner and restore the full prior policy; the runner currently only observes it. |
-| 4 | **GPU SM clocks / idle behavior:** investigate only if clock variation correlates with rate variation. Spark guidance covers SM clock locking; a separate VRAM clock lock does not apply. | Device-wide power/thermal and scheduling effects on every GPU job. Trial in an exclusive window with an agreed reset/baseline; the runner does not manage clocks. |
-| 5 | **Boot CPU isolation and IRQ/RCU placement:** consider `isolcpus`, `nohz_full`, RCU offload, and IRQ affinity if job-level affinity still leaves measurable interference. | Persistent host scheduling changes and reboot required. Removes/restricts cores available to other CI jobs and requires a separate housekeeping-core plan and boot rollback. |
-| 6 | **NIC PCIe settings / MRRS:** inspect negotiated speed, MPS, and current MRRS first; consider the Spark guide's 4096-byte MRRS setting only with measured benefit. | PF/device-wide setting, not container-scoped. The guide's procedure may require disabling Secure Boot and a persistent service. Needs lab/security approval and saved-register rollback; do not reset the NIC during shared jobs. |
-| 7 | **Hugepage-backed memory:** revisit only for future DPDK tests or an explicit `kind: huge` comparison. | Deferred for the current `host_pinned` profiles. Reservations remove RAM from general use and survive container teardown; boot configuration can require a reboot. Never resize a shared pool as routine job cleanup. |
-
-Procedures and Spark-specific caveats are in the
-[Spark system-optimization section](../../docs/tutorials/system_configuration.md#dgx-spark-profile).
-The runner currently restores MTU only; any additional tuning needs its own
-agreed restoration or administrator-managed baseline before entering CI.
-
-## Blossom test stages
-
-Run sequentially on a reserved Spark. Each output directory must be new:
+Run sequentially on an exclusively allocated Spark. Each output directory must
+be new.
 
 ```bash
 DAQIRI_IMAGE=daqiri:spark-ci
@@ -138,67 +78,66 @@ ci-results/venv/bin/python -m ci.spark.run_loopback \
   --image "$DAQIRI_IMAGE" --output "$ARTIFACT_DIR/cabled"
 ```
 
-Checked-in profiles contain test policy; CLI overrides take precedence. Options:
-`--seconds 30`, `--target-gbps 10` (`0` disables pacing), `--tx NETDEV_OR_BDF`,
-`--rx NETDEV_OR_BDF`, `--cores 5,6,7,8,9`, and
-`--[no-]strict-physical-counters`. Leave ports/cores unset for discovery. Set TX
-and RX to the lab's allocated netdevs/BDFs for a switch run; the cabled runner
-rejects two PFs exposing the same physical port. `--prepare-only` writes
-`ports.json`, concrete `config.yaml`, and a prepared summary without running hardware.
-Discovery is implemented in the runner's `discover()` and `select_ports()`:
-sysfs provides PCI BDFs, mlx5 driver/RDMA associations, Ethernet link layer,
-physical-port names, MACs, MTUs, and carrier; CPU selection uses the process's
-allowed affinity and advertised frequencies. It runs for every invocation.
+The runner discovers mlx5 Ethernet netdevs, PCI BDFs, RDMA devices, MACs, physical
+ports, MTUs, and allowed CPUs. Cabled mode rejects two PFs for the same physical
+port. Generated YAML uses one TX/RX queue, 8000-byte payloads, 64-byte headers,
+256-packet bursts, and `host_pinned` buffers.
 
-## Results and recovery
+CLI settings override the checked-in profile:
 
-Exit `0` means passed (or prepared with `--prepare-only`); nonzero fails the job.
-Archive the entire output directory in Blossom's **always/finally** step, even on
-failure. `summary.json` records schema version, effective settings, discovered
-devices, source revision, packet counts, counter deltas, warnings, and cleanup
-errors. `image.json` records the image ID; partial logs survive timeouts.
+| Option | Meaning |
+|---|---|
+| `--profile PATH` | Required YAML: `schema_version: 1`; optional `mode`, `seconds`, `target_gbps`, `strict_physical_counters`. |
+| `--image TAG` | Image built from the tested revision; default `daqiri:spark-ci`. |
+| `--output DIR` | Required new artifact directory. |
+| `--mode hardware\|cabled` | Override profile topology. |
+| `--seconds N` | Override duration; default 30. |
+| `--target-gbps G` | Aggregate TX payload rate; default 10, **0 disables pacing**. |
+| `--tx NETDEV_OR_BDF`, `--rx NETDEV_OR_BDF` | Override automatic port selection. Hardware mode requires the same port. |
+| `--cores A,B,C,D,E` | Allowed CPU IDs for master, TX queue, RX queue, TX application, RX application; otherwise discovered. |
+| `--[no-]strict-physical-counters` | Hardware mode: require exactly flat PHY counters; default off to allow background traffic. |
+| `--prepare-only` | Write discovery, generated YAML, and prepared summary without initializing hardware. |
 
-Pass requires successful execution, nonzero application TX/RX, present and zero
-queue CQ/drop counters, and counters covering the expected receive path. Hardware
-mode requires internal-loopback packets; cabled mode requires physical TX/RX.
-Hardware PHY activity is a warning with a cable attached; use strict physical
-counters only on a quiet port. NIC discard/out-of-buffer deltas are retained as
-diagnostics, not pass criteria. This test does not check payload integrity or
-require exact application TX/RX equality at shutdown.
+## Results and cleanup
 
-Inspect stable middle-of-run one-second `mlnx_perf` samples, excluding startup
-and shutdown. Hardware mode uses `vport_loopback_bytes`; cabled mode uses receiver
-PHY rate. Count traffic once and label hardware-loopback throughput separately.
+Exit 0 means passed (or prepared); nonzero fails the job. Archive the entire
+output directory in Blossom's always/finally step. It contains `summary.json`,
+resolved `config.yaml`, `ports.json`, image/source metadata, benchmark logs,
+NIC counter snapshots, and `mlnx_perf` samples, including partial timeout logs.
 
-Allow five minutes per test stage and a termination grace period for SIGTERM
-cleanup; allow longer for image builds. At normal completion the benchmark stops
-and joins its worker threads, prints statistics, and calls `daqiri::shutdown()`
-to destroy its steering rules, queues, memory registrations, and temporary
-hardware-loopback activation QP. The runner then removes its containers, stops
-monitors, and restores each selected netdev's MTU captured before initialization.
-Timeouts, errors, and SIGTERM also enter the runner's cleanup path; forced
-container removal does not guarantee the benchmark's graceful shutdown sequence.
-Cleanup failures fail the job and are recorded in `summary.json`.
+Pass requires successful execution, nonzero application TX/RX, zero queue CQ/drop
+counters (all fields required), and receive-path counters covering application
+RX: internal loopback in hardware mode, receiver PHY in cabled mode. Cabled mode
+also requires increasing sender PHY counters. Hardware PHY activity is a warning
+unless strict mode is enabled. NIC discard counters are diagnostics. Application
+TX/RX need not match exactly at shutdown.
 
-MTU is the only persistent host setting this runner changes and restores. CPU
-affinity and memlock limits are container-scoped. It does not change firmware,
-host IPs/routes, namespaces, hugepage reservations, CPU governors, pause policy,
-or switch settings. Provisioning changes remain in place; logs, virtualenvs,
-and built images are retained. SIGKILL or a host reset cannot run cleanup.
-`/tmp/daqiri-spark-ci.lock` serializes these jobs under one account; Blossom must
-also reserve the machine against other workloads.
+For rate reporting, use stable middle-of-run one-second `mlnx_perf` samples:
+`vport_loopback_bytes` for hardware mode, receiver PHY rate for cabled mode.
+Count traffic once and label hardware-loopback throughput separately.
 
-Both profile-based 30-second variants passed their final check on `spark-f2d7`
-using its 200G direct loopback cable and the CI tools layer over an existing
-DAQIRI image. Each reported TX=RX=4,653,056 packets with zero reported queue
-errors/drops; stable NIC-counter samples averaged about 10.15 Gb/s at the paced
-10 Gb/s target. MTUs and the recorded persistent host state were unchanged after
-cleanup, including four free 1 GiB hugepages. Local results and before/after
-snapshots are in ignored `ci-results/final-validation-20261019/`.
+Allow five minutes per default 30-second test stage, more for longer `--seconds`
+or image builds, and a SIGTERM cleanup grace period. The benchmark releases its
+queues and flow rules on normal exit;
+the runner removes containers, stops monitors, and restores original MTUs on
+success, failure, timeout, or SIGTERM. Cleanup errors fail the job. SIGKILL or a
+host reset cannot run cleanup. Other host tuning is not changed. The advisory
+`/tmp/daqiri-spark-ci.lock` coordinates these jobs; Blossom must reserve hardware
+against other users too.
 
-The local host retains pre-existing CPU isolation and MRRS tuning; the runner
-used allowed housekeeping cores 0-4. The Slack thread confirms hugepages and
-switch cabling on the lab Spark but does not establish its other tuning values.
-No speculative rollback was applied. Fresh-host provisioning and the lab switch
-path still need validation; this test does not establish exact host parity or
-verify the lab switch VLAN/MTU settings.
+## Optional host tuning for higher performance
+
+Explore in priority order with the lab owner using higher-rate or unpaced tests.
+These changes are not automated; coordinate shared-host impact and restoration.
+Procedures are in the
+[Spark configuration guide](../../docs/tutorials/system_configuration.md#dgx-spark-profile).
+
+| Priority | Tuning | Scope / impact |
+|---|---|---|
+| 1 | Pin queue/application workers to allocated high-frequency CPUs using `--cores`. | Job-scoped; reserve cores against competing work. |
+| 2 | Verify CPU governor is `performance`. | Changes affect shared CPU policies, power, and thermals; restore prior settings. |
+| 3 | Investigate pause counters; consider disabling pause on dedicated ports/peers if throttled. | Port/switch-wide; coordinate other raw/RDMA traffic and restore policy. |
+| 4 | Investigate GPU SM clock locking if clocks affect results. | Device-wide power/thermal impact; use an exclusive window and reset afterward. |
+| 5 | Consider boot CPU isolation and IRQ/RCU placement. | Persistent scheduling changes, reduced shared CPU capacity, and reboot required. |
+| 6 | Inspect PCIe speed/MPS and evaluate MRRS tuning. | Device-wide; record and restore original settings. |
+| 7 | Compare `kind: huge` buffers if needed. | Reservations consume shared RAM and survive container teardown. |
