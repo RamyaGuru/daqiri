@@ -1,6 +1,7 @@
 build*/
 site/
 bench-results/
+ci-results/
 
 # ResNet inference example: locally generated dataset + model artifacts
 # (built offline by applications/resnet50_inference/tools/, see the tutorial)

@@ -1,0 +1,6 @@
+# Internal single-port NIC loopback; keep Spark's cable connected for enumeration.
+schema_version: 1
+mode: hardware
+seconds: 30
+target_gbps: 10
+strict_physical_counters: false

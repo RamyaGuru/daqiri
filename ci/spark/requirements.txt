@@ -1,0 +1,2 @@
+# Host runner dependency. No DAQIRI bindings or Jupyter required.
+PyYAML>=6,<7

@@ -1,0 +1,6 @@
+# Two distinct physical ports, directly cabled or on the same switch VLAN.
+schema_version: 1
+mode: cabled
+seconds: 30
+target_gbps: 10
+strict_physical_counters: false

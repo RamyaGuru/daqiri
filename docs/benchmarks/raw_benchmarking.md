@@ -405,8 +405,16 @@ The template exercises two TX and two RX queues: UDP port 4096 steers to RX queu
 and UDP port 4097 steers to RX queue 1.
 
 This mode uses the normal receive flow rules and queue selection. Physical-network counters should
-remain flat while the DAQIRI TX and RX queue counters increase. It does not help on platforms such
-as DGX Spark that remove the NIC when no cable is detected.
+remain flat while the DAQIRI TX and RX queue counters increase. This mode does not prevent
+platforms such as DGX Spark from removing the NIC when no cable is detected. On Spark, keep the
+existing cable connected while testing internal hardware loopback.
+
+For unattended 30-second raw-ibverbs tests on DGX Spark, follow the
+[Spark CI instructions](https://github.com/NVIDIA/daqiri/blob/main/ci/spark/README.md).
+The shared runner accepts hardware-loopback and cabled-loopback profiles and handles dynamic
+port discovery, Spark memory settings, counter collection, and cleanup. The cabled variant
+supports a direct cable or two ports on the same switch VLAN; configure jumbo MTU on the switch
+before running it.
 
 #### Performance testing in hardware-loopback mode
 
