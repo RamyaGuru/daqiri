@@ -186,6 +186,7 @@ def test_sigterm_exits_with_cleanup_compatible_status(monkeypatch):
 
 
 def test_cancelled_run_retains_failure_summary(monkeypatch, tmp_path, ports):
+    monkeypatch.setattr(runner.fcntl, "flock", lambda *args: None)
     args = SimpleNamespace(output=tmp_path / "out", mode="hardware", seconds=30,
                            profile=Path("ci/spark/profiles/hardware.yaml"),
                            strict_physical_counters=False, tx=None, rx=None,
@@ -204,3 +205,84 @@ def test_cancelled_run_retains_failure_summary(monkeypatch, tmp_path, ports):
     summary = json.loads((args.output / "summary.json").read_text())
     assert summary["status"] == "failed"
     assert summary["failure"] == "143"
+
+
+@pytest.fixture
+def spark_ports():
+    result = []
+    for domain in ("0000", "0002"):
+        for function in (0, 1):
+            p = port(f"{domain}-{function}", f"p{function}", f"02:00:00:{domain[-2:]}:00:0{function}")
+            p["bdf"] = f"{domain}:01:00.{function}"
+            result.append(p)
+    return result
+
+
+@pytest.mark.parametrize("mode", ["hardware", "cabled"])
+def test_dual_selection_uses_both_attachments(mode, spark_ports):
+    pairs = runner.select_pairs(spark_ports, mode)
+    assert len(pairs) == 2
+    assert [tx["bdf"] for tx, _ in pairs] == ["0000:01:00.0", "0002:01:00.0"]
+    for tx, rx in pairs:
+        assert tx["bdf"].rsplit(".", 1)[0] == rx["bdf"].rsplit(".", 1)[0]
+        assert rx["physical_port"] == ("p0" if mode == "hardware" else "p1")
+    with pytest.raises(ValueError):
+        runner.select_pairs(spark_ports[:2], mode)
+
+
+def test_dual_prepare_splits_pacing_and_workers(monkeypatch, tmp_path, spark_ports):
+    args = runner.parse_args(["--profile", "ci/spark/profiles/cabled.yaml",
+                              "--target-gbps", "10", "--output", str(tmp_path / "out"),
+                              "--cores", "0,1,2,3,4,5,6,7,8", "--prepare-only"])
+    monkeypatch.setattr(runner, "discover", lambda: spark_ports)
+    monkeypatch.setattr(runner.os, "sched_getaffinity", lambda _: set(range(9)))
+    runner.run(args)
+    summary = json.loads((args.output / "summary.json").read_text())
+    assert summary["status"] == "prepared"
+    assert [p["target_gbps"] for p in summary["pairs"]] == [5, 5]
+    assert [p["cores"] for p in summary["pairs"]] == [[0, 1, 2, 3, 4], [0, 5, 6, 7, 8]]
+    assert all((args.output / f"pair-{i}/config.yaml").exists() for i in range(2))
+
+
+def test_throughput_excludes_edges_and_shared_phy(tmp_path):
+    (tmp_path / "rx-mlnx_perf.log").write_text("\n".join(
+        f"rx_bytes_phy: 1 Bps = 200,000 Mbps\nrx_vport_unicast_bytes: 1 Bps = {v} Mbps"
+        for v in [0, 1, 2, "100,000", "102,000", 3, 0]))
+    rate = runner.throughput_snapshot("cabled", tmp_path, {"netdev": "rx"})
+    assert rate["mean_gbps"] == 101
+    assert rate["sample_count"] == 2
+    assert rate["min_gbps"] == 100
+    assert rate["max_gbps"] == 102
+    pairs = [dict(status="passed", results={"throughput": rate},
+                  application_packets={"TX": 10, "RX": 9})] * 2
+    result = runner.aggregate_results(pairs)
+    assert result["throughput"]["mean_gbps"] == 202
+    assert result["application_packets"] == {"TX": 20, "RX": 18}
+    assert runner.throughput_snapshot("hardware", tmp_path, {"netdev": "rx"})["mean_gbps"] is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_dual_children_propagate_results_and_failure(monkeypatch, tmp_path, fail):
+    def fake_execute(args, out, tx, rx, cores, summary):
+        if fail and tx["netdev"] == "bad":
+            raise RuntimeError("pair failed")
+        summary.update(status="passed", application_packets={"TX": 5, "RX": 4},
+                       results={"throughput": {"mean_gbps": 10}})
+
+    monkeypatch.setattr(runner, "execute", fake_execute)
+    jobs = []
+    for name in ("good", "bad"):
+        out = tmp_path / name
+        out.mkdir()
+        jobs.append((out, {"netdev": name}, {}, [0, 1, 2, 3, 4], {"status": "running"}))
+    summary = {}
+    if fail:
+        with pytest.raises(RuntimeError, match="PF pairs failed"):
+            runner.execute_pairs(SimpleNamespace(), jobs, summary)
+        assert summary["pairs"][1]["failure"] == "pair failed"
+    else:
+        runner.execute_pairs(SimpleNamespace(), jobs, summary)
+        assert summary["status"] == "passed"
+        assert summary["results"]["throughput"]["mean_gbps"] == 20
+    assert summary["results"]["pairs_passed"] == (1 if fail else 2)
+    assert all((job[0] / "summary.json").exists() for job in jobs)

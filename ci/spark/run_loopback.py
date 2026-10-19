@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -72,6 +73,111 @@ def select_ports(ports: list[dict], mode: str, tx_name: str | None,
     if not candidates:
         raise ValueError("Cabled mode needs two linked, distinct physical ports (p0 and p1)")
     return tx, candidates[0]
+
+
+def select_pairs(ports: list[dict], mode: str) -> list[tuple[dict, dict]]:
+    """Use p0 on each PCIe attachment, paired with its p1 for wire tests."""
+    groups = {}
+    for port in ports:
+        groups.setdefault(port["bdf"].rsplit(".", 1)[0], []).append(port)
+    pairs = []
+    for attachment, members in sorted(groups.items()):
+        p0 = [p for p in members if p["physical_port"] == "p0"]
+        if len(p0) != 1:
+            raise ValueError(f"Expected one p0 PF on attachment {attachment}")
+        tx = p0[0]
+        p1 = [p for p in members if p["physical_port"] == "p1"]
+        if mode == "cabled" and len(p1) != 1:
+            raise ValueError(f"Expected one p1 PF on attachment {attachment}")
+        pairs.append(select_ports(members, mode, tx["bdf"],
+                                  p1[0]["bdf"] if mode == "cabled" else None))
+    if len(pairs) != 2:
+        raise ValueError("Dual mode requires two Spark PCIe attachments; use --pairs single for one")
+    return pairs
+
+
+def throughput_snapshot(mode: str, out: Path, rx: dict) -> dict:
+    # RX vport counters belong to each PF. PHY counters are shared by the
+    # multiplexed aliases and must never be summed across attachments.
+    counter = "vport_loopback_bytes" if mode == "hardware" else "rx_vport_unicast_bytes"
+    text = read(out / f"{rx['netdev']}-mlnx_perf.log")
+    samples = [float(match.group(1).replace(",", "")) / 1000
+               for line in text.splitlines()
+               if re.match(rf"\s*{counter}:", line)
+               for match in [re.search(r"=\s*([\d,.]+)\s+Mbps", line)] if match]
+    stable = samples[3:-2]
+    result = dict(kind="hardware-loopback" if mode == "hardware" else "cabled-rx-vport",
+                  counter=counter, approximate=True,
+                  timing_note="mlnx_perf may use nominal intervals; rates can exceed line rate",
+                  sample_seconds=1, discarded_first_samples=3,
+                  discarded_last_samples=2, sample_count=len(stable))
+    if stable:
+        result.update(mean_gbps=sum(stable) / len(stable),
+                      min_gbps=min(stable), max_gbps=max(stable))
+    else:
+        result.update(mean_gbps=None, unavailable_reason="Insufficient stable one-second samples")
+    return result
+
+
+def aggregate_results(pairs: list[dict]) -> dict:
+    rates = [p.get("results", {}).get("throughput", {}).get("mean_gbps") for p in pairs]
+    return dict(
+        application_packets={direction: sum(p.get("application_packets", {}).get(direction, 0)
+                                             for p in pairs) for direction in ("TX", "RX")},
+        pairs_passed=sum(p.get("status") == "passed" for p in pairs), pairs_total=len(pairs),
+        error_count=sum(len(p.get("errors", [])) + len(p.get("cleanup_errors", []))
+                        + bool(p.get("failure") and not p.get("errors")) for p in pairs),
+        queue_counters_max={field: max((p.get("results", {}).get("queue_counters_max", {}).get(field, 0)
+                                       or 0 for p in pairs), default=None)
+                            for field in ("cqe_errors", "app_ring_full_drops", "handoff_full_drops")},
+        throughput=dict(mean_gbps=sum(rates) if all(r is not None for r in rates) else None,
+                        approximate=True,
+                        timing_note="mlnx_perf may use nominal intervals; rates can exceed line rate",
+                        method="sum of per-PF stable mean rates; shared PHY counters excluded"))
+
+
+def execute_pair(args, out, tx, rx, cores, summary):
+    """Child process: retain its result even on cancellation or cleanup failure."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        execute(args, out, tx, rx, cores, summary)
+    except BaseException as exc:
+        summary.update(status="failed", failure=str(exc))
+        raise
+    finally:
+        (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+
+def execute_pairs(args, jobs, summary):
+    # Fork preserves the prepared arguments without extra dependencies. Only the
+    # parent acquires the host lock; children operate on disjoint PFs and workers.
+    processes = []
+    try:
+        for job in jobs:
+            proc = multiprocessing.get_context("fork").Process(target=execute_pair, args=(args, *job))
+            proc.start()
+            processes.append(proc)
+        for proc in processes:
+            proc.join()
+        if any(proc.exitcode != 0 for proc in processes):
+            raise RuntimeError("One or more PF pairs failed; inspect pair summaries")
+        summary["status"] = "passed"
+    finally:
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in processes:
+            proc.join(timeout=60)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+                summary.setdefault("cleanup_errors", []).append("Pair cleanup exceeded 60 seconds")
+        summary["pairs"] = [json.loads((job[0] / "summary.json").read_text())
+                            if (job[0] / "summary.json").exists() else
+                            dict(status="failed", failure="Missing pair summary") for job in jobs]
+        summary["results"] = aggregate_results(summary["pairs"])
+        if summary.get("cleanup_errors"):
+            raise RuntimeError("Pair cleanup failed")
 
 
 def make_config(mode: str, tx: dict, rx: dict, cores: list[int]) -> dict:
@@ -163,31 +269,55 @@ def run(args: argparse.Namespace) -> None:
         summary["source_revision"] = revision.stdout.strip()
         ports = discover()
         (out / "ports.json").write_text(json.dumps(ports, indent=2))
-        tx, rx = select_ports(ports, args.mode, args.tx, args.rx)
+        dual = getattr(args, "pairs", "single") == "both"
+        if dual and (args.tx or args.rx):
+            raise ValueError("--tx/--rx require --pairs single; dual mode discovers both attachments")
+        pairs = select_pairs(ports, args.mode) if dual else [
+            select_ports(ports, args.mode, args.tx, args.rx)]
         allowed = os.sched_getaffinity(0)
+        count = 1 + 4 * len(pairs)
         cores = args.cores or sorted(allowed, key=lambda c: (
-            -int(read(Path(f"/sys/devices/system/cpu/cpufreq/policy{c}/cpuinfo_max_freq"), "0")), c))[:5]
-        if not set(cores) <= allowed:
-            raise ValueError("Selected cores are outside this process's CPU affinity")
-        document = make_config(args.mode, tx, rx, cores)
-        (out / "config.yaml").write_text(render_document(document))
-        summary.update(tx=tx, rx=rx, cores=cores, image=args.image,
-                       target_gbps=args.target_gbps, memory_kind="host_pinned")
-        print(json.dumps(summary, indent=2), flush=True)
+            -int(read(Path(f"/sys/devices/system/cpu/cpufreq/policy{c}/cpuinfo_max_freq"), "0")), c))[:count]
+        if len(cores) != count or len(set(cores)) != count or not set(cores) <= allowed:
+            raise ValueError(f"Provide exactly {count} distinct allowed CPU cores")
+        jobs = []
+        for index, (tx, rx) in enumerate(pairs):
+            pair_out = out / f"pair-{index}" if dual else out
+            if dual:
+                pair_out.mkdir()
+            pair_cores = [cores[0], *cores[1 + 4 * index:5 + 4 * index]]
+            document = make_config(args.mode, tx, rx, pair_cores)
+            (pair_out / "config.yaml").write_text(render_document(document))
+            pair_summary = dict(summary, tx=tx, rx=rx, cores=pair_cores, image=args.image,
+                                target_gbps=args.target_gbps / len(pairs), memory_kind="host_pinned")
+            jobs.append((pair_out, tx, rx, pair_cores, pair_summary))
+        summary.update(image=args.image, target_gbps=args.target_gbps, cores=cores,
+                       selection="both" if dual else "single")
+        if not dual:
+            summary.update(jobs[0][-1])
+            jobs[0] = (*jobs[0][:-1], summary)
         if args.prepare_only:
             summary["status"] = "prepared"
+            if dual:
+                summary["pairs"] = [dict(job[-1], status="prepared") for job in jobs]
             return
 
-        # Advisory host lock: use the same path for every runner using this Spark.
         with open("/tmp/daqiri-spark-ci.lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            execute(args, out, tx, rx, cores, summary)
+            if dual:
+                pair_args = argparse.Namespace(**vars(args))
+                pair_args.target_gbps /= len(pairs)
+                execute_pairs(pair_args, jobs, summary)
+            else:
+                execute(args, *jobs[0])
     except BaseException as exc:
         summary["status"] = "failed"
         summary["failure"] = str(exc)
         raise
     finally:
         (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        if "results" in summary:
+            print(json.dumps(dict(status=summary["status"], results=summary["results"]), indent=2), flush=True)
         print(f"{summary['status']}: {out / 'summary.json'}", flush=True)
 
 
@@ -271,6 +401,7 @@ def execute(args: argparse.Namespace, out: Path, tx: dict, rx: dict,
                   if key in before[net]} for net in selected}
         relevant = {"tx_packets_phy", "rx_packets_phy", "tx_bytes_phy", "rx_bytes_phy",
                     "vport_loopback_packets", "vport_loopback_bytes", "rx_out_of_buffer",
+                    "rx_vport_unicast_bytes", "tx_vport_unicast_bytes",
                     "rx_discards_phy", "tx_discards_phy"}
         summary["counter_deltas"] = {net: {key: value for key, value in values.items()
                                           if key in relevant} for net, values in deltas.items()}
@@ -291,6 +422,12 @@ def execute(args: argparse.Namespace, out: Path, tx: dict, rx: dict,
             if (counts := re.findall(rf"{direction} complete: interface=\S+ queue=0 packets=(\d+)", log))}
         if any(p.poll() is not None for p in monitors):
             errors.append("mlnx_perf exited before benchmark completion; inspect monitor logs")
+        summary["results"] = dict(
+            application_packets=summary["application_packets"],
+            throughput=throughput_snapshot(args.mode, out, rx),
+            queue_counters_max={field: max(map(int, re.findall(rf"\b{field}=(\d+)", log)), default=None)
+                                for field in ("cqe_errors", "app_ring_full_drops", "handoff_full_drops")},
+            error_count=len(errors))
         summary["errors"] = errors
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -326,20 +463,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--mode", choices=("hardware", "cabled"))
+    parser.add_argument("--pairs", choices=("both", "single"), help="both PCIe attachments (default) or one PF pair")
     parser.add_argument("--seconds", type=int)
     parser.add_argument("--image", default="daqiri:spark-ci")
     parser.add_argument("--tx", help="TX netdev or PCI BDF; otherwise discovered")
     parser.add_argument("--rx", help="RX netdev or PCI BDF; otherwise discovered")
     parser.add_argument("--cores", type=lambda s: [int(c) for c in s.split(",")])
     parser.add_argument("--target-gbps", type=float,
-                        help="aggregate payload rate in Gb/s; default 0 is unpaced")
+                        help="total payload rate across both pairs in Gb/s; default 0 is unpaced")
     parser.add_argument("--output", type=Path, required=True, help="new artifact directory")
     parser.add_argument("--prepare-only", action="store_true", help="discover and render without running hardware")
     parser.add_argument("--strict-physical-counters", action=argparse.BooleanOptionalAction,
                         default=None,
                         help="hardware mode: require exactly flat PHY counters on a quiet port")
     args = parser.parse_args(argv)
-    defaults = dict(mode="hardware", seconds=30, target_gbps=0,
+    defaults = dict(mode="hardware", pairs="both", seconds=30, target_gbps=0,
                     strict_physical_counters=False)
     try:
         profile = yaml.safe_load(args.profile.read_text())
@@ -352,6 +490,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError(f"unknown profile keys: {sorted(map(str, unknown))}")
         settings = defaults | {k: v for k, v in profile.items() if k in defaults}
         for key, value in settings.items():
+            if key == "pairs" and value not in ("both", "single"):
+                raise ValueError("pairs must be both or single")
             if key == "mode" and value not in ("hardware", "cabled"):
                 raise ValueError("mode must be hardware or cabled")
             if key == "seconds" and (type(value) is not int or value <= 0):
