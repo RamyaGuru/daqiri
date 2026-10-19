@@ -7,9 +7,13 @@ Each test runs for 30 seconds and is **unpaced by default** (`target_gbps: 0`).
 To limit the aggregate TX payload rate, set a positive `target_gbps` in a profile
 or pass `--target-gbps 10` for a paced 10 Gb/s run.
 
-Run all commands on the Spark **host, from the DAQIRI checkout root**. Blossom
-provides checkout, image preparation, exclusive hardware allocation, timeout,
-and artifact archiving; the runner handles discovery, execution, and cleanup.
+This directory provides runner scripts, test profiles, and example commands
+that Blossom can invoke. It does **not** implement or register Blossom jobs.
+Configure those jobs separately to handle checkout, image preparation, exclusive
+hardware allocation, timeouts, and artifact archiving. The runner handles
+discovery, execution, and cleanup.
+
+Run all commands on the Spark **host, from the DAQIRI checkout root**.
 
 ## Initial provisioning (outside of Blossom jobs)
 
