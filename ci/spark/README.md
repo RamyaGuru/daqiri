@@ -1,10 +1,11 @@
 # DGX Spark ibverbs CI smoke tests
 
-**By default, each test runs unpaced for 30 seconds (`target_gbps: 0`).** To limit
-the aggregate TX payload rate, set a positive `target_gbps` in a profile or pass
-`--target-gbps 10` for a paced 10 Gb/s run.
 These tests check raw Ethernet TX/RX and flow steering with the ibverbs engine;
 they do not impose a throughput threshold or validate payload contents.
+
+Each test runs for 30 seconds and is **unpaced by default** (`target_gbps: 0`).
+To limit the aggregate TX payload rate, set a positive `target_gbps` in a profile
+or pass `--target-gbps 10` for a paced 10 Gb/s run.
 
 Run all commands on the Spark **host, from the DAQIRI checkout root**. Blossom
 provides checkout, image preparation, exclusive hardware allocation, timeout,
